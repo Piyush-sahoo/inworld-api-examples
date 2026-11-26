@@ -8,6 +8,9 @@ import { config } from "../config.js";
 
 interface InworldRealtimeEvents {
   connected: (sessionId: string) => void;
+  // The session config (including the g711_ulaw input format) has been applied,
+  // so caller audio sent from now on is understood.
+  ready: () => void;
   audio: (base64Audio: string) => void;
   audioDone: () => void;
   speechStarted: () => void;
@@ -129,6 +132,7 @@ export class InworldRealtimeClient extends EventEmitter {
           },
         });
         this.send({ type: "response.create" });
+        this.emit("ready");
         break;
 
       case "response.output_audio.delta":

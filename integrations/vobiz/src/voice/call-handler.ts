@@ -18,6 +18,10 @@ interface VobizStreamMessage {
 // 50ms of mulaw 8kHz = 400 bytes (8000 samples/sec × 0.05s × 1 byte/sample)
 const MIN_CHUNK_BYTES = 400;
 
+// Caller audio held while the Inworld session is being set up: 5 s of mulaw 8kHz.
+// Older audio is dropped first if setup takes longer than that.
+const MAX_PENDING_BYTES = 8000 * 5;
+
 // Peak level (16-bit PCM) above which an inbound chunk counts as caller voice.
 // Only used to time latency from the caller's real end of speech.
 const VOICE_PEAK_THRESHOLD = 1000;
@@ -40,6 +44,10 @@ export function handleCallStream(vobizWs: WebSocket): void {
   let inworld: InworldRealtimeClient | null = null;
   let outBuffer = Buffer.alloc(0);
   let inBuffer = Buffer.alloc(0);
+  // Inworld only understands caller audio once the session config is applied,
+  // so audio that arrives earlier (often the callee's "hello") is held here.
+  let inworldReady = false;
+  let pendingAudio = Buffer.alloc(0);
   let callTimer: NodeJS.Timeout | null = null;
   let agentHasSpoken = false;
 
@@ -81,6 +89,17 @@ export function handleCallStream(vobizWs: WebSocket): void {
     }
   }
 
+  // Sends caller audio to Inworld in ≥50ms chunks.
+  function forwardCallerAudio(audio: Buffer) {
+    if (!inworld) return;
+    inBuffer = Buffer.concat([inBuffer, audio]);
+    while (inBuffer.length >= MIN_CHUNK_BYTES) {
+      const chunk = inBuffer.subarray(0, MIN_CHUNK_BYTES);
+      inworld.sendAudio(chunk.toString("base64"));
+      inBuffer = inBuffer.subarray(MIN_CHUNK_BYTES);
+    }
+  }
+
   // Stopping the stream ends the call, because there is no XML after <Stream>.
   function endCall(reason: string) {
     if (vobizWs.readyState === WebSocket.OPEN && streamId) {
@@ -111,6 +130,15 @@ export function handleCallStream(vobizWs: WebSocket): void {
         );
 
         inworld = new InworldRealtimeClient();
+
+        inworld.on("ready", () => {
+          inworldReady = true;
+          if (pendingAudio.length > 0) {
+            console.log(`[call] Sending ${pendingAudio.length / 8}ms of caller audio received during setup`);
+            forwardCallerAudio(pendingAudio);
+            pendingAudio = Buffer.alloc(0);
+          }
+        });
 
         inworld.on("audio", (base64Audio) => {
           const audio = Buffer.from(base64Audio, "base64");
@@ -185,23 +213,39 @@ export function handleCallStream(vobizWs: WebSocket): void {
 
       case "media":
         if (inworld && typeof msg.media?.payload === "string") {
-          inBuffer = Buffer.concat([inBuffer, Buffer.from(msg.media.payload, "base64")]);
-          while (inBuffer.length >= MIN_CHUNK_BYTES) {
-            const chunk = inBuffer.subarray(0, MIN_CHUNK_BYTES);
-            if (hasVoice(chunk)) lastVoiceAt = Date.now();
-            inworld.sendAudio(chunk.toString("base64"));
-            inBuffer = inBuffer.subarray(MIN_CHUNK_BYTES);
+          const audio = Buffer.from(msg.media.payload, "base64");
+          if (hasVoice(audio)) lastVoiceAt = Date.now();
+          if (inworldReady) {
+            forwardCallerAudio(audio);
+          } else {
+            pendingAudio = Buffer.concat([pendingAudio, audio]);
+            if (pendingAudio.length > MAX_PENDING_BYTES) {
+              pendingAudio = pendingAudio.subarray(pendingAudio.length - MAX_PENDING_BYTES);
+            }
           }
         }
         break;
     }
   });
 
+  function cleanup() {
+    if (callTimer) clearTimeout(callTimer);
+    callTimer = null;
+    inworld?.close();
+    inworld = null;
+    pendingAudio = Buffer.alloc(0);
+  }
+
+  // Without a listener, a socket error would be thrown and crash the process,
+  // ending every other call on this server. ws emits close after error.
+  vobizWs.on("error", (err) => {
+    console.error(`[call] Stream error: ${err.message}`);
+    cleanup();
+  });
+
   // Vobiz sends no stop event: the WebSocket closing is the end of the call.
   vobizWs.on("close", () => {
     console.log("[call] Stream closed");
-    if (callTimer) clearTimeout(callTimer);
-    inworld?.close();
-    inworld = null;
+    cleanup();
   });
 }
